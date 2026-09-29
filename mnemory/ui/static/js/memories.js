@@ -20,7 +20,11 @@ function memoriesTab() {
       labels_json: '',
     },
 
-    sortBy: 'storage',
+    sortBy: 'newest',
+    dateFilter: 'all',
+    customStart: '',
+    customEnd: '',
+    dateBounds: {},
     filterArtifactsOnly: false,
     filterAgentId: '',
     filterDecayedOnly: false,
@@ -122,8 +126,28 @@ function memoriesTab() {
       this.loadError = '';
       this.loading = true;
       try {
+        if (!append) {
+          const now = new Date();
+          this.dateBounds = {};
+          if (this.dateFilter === 'hour') {
+            this.dateBounds.created_start = new Date(now.getTime() - 3600000).toISOString();
+            this.dateBounds.created_end = now.toISOString();
+          } else if (this.dateFilter === 'today') {
+            this.dateBounds.created_start = new Date(now.getFullYear(), now.getMonth(), now.getDate()).toISOString();
+            this.dateBounds.created_end = now.toISOString();
+          } else if (this.dateFilter === 'custom') {
+            if (this.customStart) this.dateBounds.created_start = new Date(this.customStart).toISOString();
+            if (this.customEnd) this.dateBounds.created_end = new Date(this.customEnd).toISOString();
+          }
+          if (this.dateBounds.created_start && this.dateBounds.created_end
+              && this.dateBounds.created_start >= this.dateBounds.created_end) {
+            throw new Error('Start date must be before end date');
+          }
+        }
         const params = {
           limit: this.pageSize,
+          sort: this.sortBy,
+          ...this.dateBounds,
           include_decayed: this.filterDecayedOnly ? true : this.filters.include_decayed,
           decayed_only: this.filterDecayedOnly,
           has_artifacts: this.filterArtifactsOnly,
@@ -153,14 +177,13 @@ function memoriesTab() {
     },
 
     loadMore() {
-      if (this.hasMoreOnServer && !this.loadError) this.loadMemories(true);
+      if (this.hasMoreOnServer && !this.loadError && !this.loading) this.loadMemories(true);
     },
 
     applyFilters() {
       this.loadMemories(false);
     },
 
-    /** Cursor order is stable point-ID order. */
     onSortChange() {
       this.loadMemories(false);
     },

@@ -9,6 +9,7 @@ from __future__ import annotations
 import json
 import logging
 from dataclasses import asdict
+from datetime import datetime, timezone
 
 from fastapi import APIRouter, Depends, Header, HTTPException, Query
 from fastapi.responses import Response
@@ -499,11 +500,34 @@ def browse_memories(
     has_artifacts: bool = Query(False),
     decayed_only: bool = Query(False),
     include_decayed: bool = Query(False),
+    sort: str = Query("newest"),
+    created_start: str | None = Query(None),
+    created_end: str | None = Query(None),
     ctx: SessionContext = Depends(get_session_context),
 ):
-    """Browse every authorized active memory with a stable opaque cursor."""
+    """Browse authorized active memories in collection-wide creation order."""
     if memory_layer and memory_layer not in ("raw", "consolidated"):
         raise HTTPException(status_code=422, detail="Invalid memory layer")
+    if sort not in ("newest", "oldest", "storage"):
+        raise HTTPException(status_code=422, detail="Invalid browse sort")
+    bounds = []
+    for value in (created_start, created_end):
+        if value is None:
+            bounds.append(None)
+            continue
+        try:
+            parsed = datetime.fromisoformat(value)
+            if parsed.tzinfo is None or parsed.utcoffset() is None:
+                raise ValueError
+            bounds.append(parsed.astimezone(timezone.utc).isoformat())
+        except ValueError:
+            raise HTTPException(
+                status_code=422,
+                detail="Creation dates must be ISO 8601 datetimes with a timezone",
+            ) from None
+    created_start, created_end = bounds
+    if created_start and created_end and created_start >= created_end:
+        raise HTTPException(status_code=422, detail="Creation start must precede end")
     cat_list = (
         [value.strip() for value in categories.split(",")] if categories else None
     )
@@ -526,6 +550,9 @@ def browse_memories(
         "has_artifacts": has_artifacts,
         "decayed_only": decayed_only,
         "include_decayed": include_decayed,
+        "sort": sort,
+        "created_start": created_start,
+        "created_end": created_end,
     }
     try:
         offset = decode_cursor(cursor, binding) if cursor else None
@@ -550,6 +577,9 @@ def browse_memories(
             has_artifacts=has_artifacts,
             decayed_only=decayed_only,
             include_decayed=include_decayed,
+            sort=sort,
+            created_start=created_start,
+            created_end=created_end,
         )
     except ValueError as exc:
         raise HTTPException(status_code=422, detail=str(exc)) from None

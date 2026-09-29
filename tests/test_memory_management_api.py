@@ -4,7 +4,11 @@ from pathlib import Path
 from unittest.mock import MagicMock
 
 import pytest
+from fastapi import FastAPI
+from fastapi.testclient import TestClient
 
+from mnemory.api import memories as memories_api
+from mnemory.api.deps import SessionContext, get_session_context
 from mnemory.api.ui_projections import (
     decode_cursor,
     encode_cursor,
@@ -256,6 +260,124 @@ def test_browse_active_advances_cursor_without_skipping_authorized_rows():
     ]
     assert page["next_offset"] is None
     assert store._client.scroll.call_args_list[1].kwargs["offset"] == "revision-1"
+
+
+def test_creation_order_and_date_filters_cover_all_pages_and_authorized_rows(
+    monkeypatch,
+):
+    from uuid import NAMESPACE_URL, uuid5
+
+    from qdrant_client import QdrantClient, models
+
+    store = VectorStore.__new__(VectorStore)
+    store._config = MagicMock()
+    store._config.vector.collection_name = "memories"
+    backend = QdrantClient(":memory:")
+    backend.create_collection(
+        "memories",
+        vectors_config=models.VectorParams(size=2, distance=models.Distance.COSINE),
+    )
+    store._client = MagicMock(wraps=backend)
+    rows = []
+    for index in range(225):
+        created = f"2026-09-29T{index // 60:02}:{index % 60:02}:00+00:00"
+        if index < 210:
+            created = "2026-09-29T02:00:00+00:00"
+        point = models.PointStruct(
+            id=str(uuid5(NAMESPACE_URL, f"browse-{index}")),
+            vector=[1.0, 0.0],
+            payload={
+                "data": f"memory {index}",
+                "created_at": created,
+                "created_at_utc": created,
+                "owner_id": "mallory" if index == 223 else "alice",
+                "user_id": "alice",
+                "agent_id": "other" if index == 224 else "agent:child",
+                "revision_state": "active",
+            },
+        )
+        rows.append(point)
+    backend.upsert("memories", points=rows)
+    monkeypatch.setattr(memories_api, "_get_service", lambda: MagicMock(vector=store))
+    monkeypatch.setattr(memories_api, "_record", lambda *_args: None)
+    app = FastAPI()
+    app.include_router(memories_api.router, prefix="/api/memories")
+    app.dependency_overrides[get_session_context] = lambda: SessionContext(
+        user_id="alice", owner_id="alice", agent_id="agent", timezone=None
+    )
+    client = TestClient(app)
+    params = {"limit": 50, "sort": "newest", "created_start": "2026-09-29T00:00:00Z"}
+    authorized = [
+        point
+        for point in rows
+        if point.payload["agent_id"] != "other" and point.payload["owner_id"] == "alice"
+    ]
+    for sort in ("newest", "oldest"):
+        found = []
+        cursor = None
+        while True:
+            before = store._client.scroll.call_count
+            response = client.get(
+                "/api/memories/browse",
+                params={
+                    **params,
+                    "sort": sort,
+                    **({"cursor": cursor} if cursor else {}),
+                },
+            )
+            assert response.status_code == 200, response.text
+            assert store._client.scroll.call_count - before < 8
+            payload = response.json()
+            found.extend(item["id"] for item in payload["results"])
+            cursor = payload["next_cursor"]
+            if not cursor:
+                break
+        timestamps = sorted(
+            {point.payload["created_at"] for point in authorized},
+            reverse=sort == "newest",
+        )
+        expected = [
+            point.id
+            for stamp in timestamps
+            for point in sorted(
+                (point for point in authorized if point.payload["created_at"] == stamp),
+                key=lambda point: point.id,
+            )
+        ]
+        assert found == expected, (sort, found[45:56], expected[45:56], len(found))
+        assert len(set(found)) == len(authorized)
+
+    first = client.get("/api/memories/browse", params=params).json()
+    assert (
+        client.get(
+            "/api/memories/browse",
+            params={
+                **params,
+                "cursor": first["next_cursor"],
+                "sort": "oldest",
+            },
+        ).status_code
+        == 422
+    )
+    assert (
+        client.get(
+            "/api/memories/browse",
+            params={
+                **params,
+                "created_end": "2026-09-29T02:00:00Z",
+            },
+        ).json()["results"]
+        == []
+    )
+    for bad in (
+        {"sort": "random"},
+        {"created_start": "2026-09-29T00:00"},
+        {"created_end": "2026-09-28T00:00:00Z"},
+    ):
+        assert (
+            client.get("/api/memories/browse", params={**params, **bad}).status_code
+            == 422
+        )
 
 
 def test_history_projection_paginates_after_redaction():
