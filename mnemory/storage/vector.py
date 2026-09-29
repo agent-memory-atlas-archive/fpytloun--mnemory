@@ -1033,8 +1033,11 @@ class VectorStore:
         has_artifacts: bool = False,
         decayed_only: bool = False,
         include_decayed: bool = False,
+        sort: str = "storage",
+        created_start: str | None = None,
+        created_end: str | None = None,
     ) -> dict[str, Any]:
-        """Return one authorized active-memory page in stable point-ID order."""
+        """Return one authorized active-memory page in the requested order."""
         must: list[Any] = [
             _build_owner_scope_condition(user_id, owner_id),
             _active_revision_condition(),
@@ -1086,6 +1089,25 @@ class VectorStore:
                 )
             )
 
+        if created_start or created_end:
+            must.append(
+                FieldCondition(
+                    key="created_at",
+                    range=DatetimeRange(gte=created_start, lt=created_end),
+                )
+            )
+
+        if sort != "storage":
+            return self._browse_by_creation(
+                must=must,
+                session_agent_id=session_agent_id,
+                include_decayed=include_decayed,
+                decayed_only=decayed_only,
+                cursor=cursor,
+                limit=limit,
+                sort=sort,
+            )
+
         # Agent prefix authorization cannot be expressed safely as a Qdrant
         # keyword filter. Scroll bounded chunks and discard inaccessible rows
         # before the cursor leaves the server.
@@ -1130,6 +1152,188 @@ class VectorStore:
         return {
             "results": results,
             "next_offset": str(next_offset) if next_offset is not None else None,
+        }
+
+    def _browse_by_creation(
+        self,
+        *,
+        must: list[Any],
+        session_agent_id: str | None,
+        include_decayed: bool,
+        decayed_only: bool,
+        cursor: str | int | None,
+        limit: int,
+        sort: str,
+    ) -> dict[str, Any]:
+        """Page by indexed creation time, with point-ID paging within timestamp ties.
+
+        Qdrant does not support an ID offset with order_by, so each boundary
+        timestamp is read by its indexed equality filter in stable point-ID order.
+        """
+        import json
+        from uuid import UUID
+
+        from qdrant_client.models import Direction, OrderBy
+
+        def utc_created(point):
+            return (
+                datetime.fromisoformat(point.payload["created_at"])
+                .astimezone(timezone.utc)
+                .isoformat(timespec="microseconds")
+            )
+
+        if cursor is not None:
+            try:
+                boundary = json.loads(str(cursor))
+                if (
+                    not isinstance(boundary, list)
+                    or len(boundary) != 2
+                    or not isinstance(boundary[0], str)
+                    or not isinstance(boundary[1], str)
+                ):
+                    raise ValueError
+                boundary_time = (
+                    datetime.fromisoformat(boundary[0])
+                    .astimezone(timezone.utc)
+                    .isoformat(timespec="microseconds")
+                )
+                boundary_id = str(UUID(boundary[1]))
+            except (TypeError, ValueError, KeyError):
+                raise ValueError("Invalid creation-order cursor") from None
+        else:
+            boundary_time = None
+            boundary_id = None
+
+        page = []
+
+        def include(point, created):
+            item_agent_id = (point.payload or {}).get("agent_id")
+            if (
+                session_agent_id
+                and item_agent_id
+                and (
+                    item_agent_id != session_agent_id
+                    and not item_agent_id.startswith(session_agent_id + ":")
+                )
+            ):
+                return
+            item = self._point_to_memory(point)
+            if not include_decayed and not decayed_only and should_exclude(item, False):
+                return
+            page.append(((created, str(point.id)), item))
+
+        while len(page) < limit + 1:
+            if boundary_id is not None:
+                # Equal timestamps use the native point-ID cursor, not the
+                # unspecified tie order from Qdrant's order_by scroll.
+                equal_filter = Filter(
+                    must=must
+                    + [
+                        FieldCondition(
+                            key="created_at",
+                            range=DatetimeRange(gte=boundary_time, lte=boundary_time),
+                        )
+                    ]
+                )
+                offset = boundary_id
+                while len(page) < limit + 1:
+                    points, next_offset = self._client.scroll(
+                        collection_name=self.collection_name,
+                        scroll_filter=equal_filter,
+                        limit=min(200, limit + 1 - len(page)),
+                        offset=offset,
+                        with_payload=True,
+                        with_vectors=False,
+                    )
+                    for point in points:
+                        # Qdrant's point-ID offset is inclusive.
+                        if str(point.id) == boundary_id:
+                            continue
+                        include(point, boundary_time)
+                    if next_offset is None:
+                        boundary_id = None
+                        break
+                    offset = next_offset
+                if len(page) >= limit + 1:
+                    break
+
+            time_filter = (
+                [
+                    FieldCondition(
+                        key="created_at",
+                        range=DatetimeRange(
+                            lt=boundary_time if sort == "newest" else None,
+                            gt=boundary_time if sort == "oldest" else None,
+                        ),
+                    )
+                ]
+                if boundary_time
+                else []
+            )
+            points, _ = self._client.scroll(
+                collection_name=self.collection_name,
+                scroll_filter=Filter(must=must + time_filter),
+                order_by=OrderBy(
+                    key="created_at",
+                    direction=Direction.DESC if sort == "newest" else Direction.ASC,
+                ),
+                limit=max(200, limit + 1 - len(page)),
+                with_payload=True,
+                with_vectors=False,
+            )
+            if not points:
+                break
+
+            # Every timestamp before the final group is complete in this
+            # ordered batch. Resolve the final group by ID scroll instead:
+            # it may continue beyond Qdrant's order_by limit.
+            final_time = utc_created(points[-1])
+            groups: dict[str, list] = {}
+            for point in points:
+                created = utc_created(point)
+                if created != final_time:
+                    groups.setdefault(created, []).append(point)
+            for created, group in groups.items():
+                for point in sorted(group, key=lambda value: str(value.id)):
+                    include(point, created)
+                    if len(page) >= limit + 1:
+                        break
+                if len(page) >= limit + 1:
+                    break
+            if len(page) >= limit + 1:
+                break
+            boundary_time = final_time
+            boundary_id = None
+            offset = None
+            equal_filter = Filter(
+                must=must
+                + [
+                    FieldCondition(
+                        key="created_at",
+                        range=DatetimeRange(gte=final_time, lte=final_time),
+                    )
+                ]
+            )
+            while len(page) < limit + 1:
+                points, next_offset = self._client.scroll(
+                    collection_name=self.collection_name,
+                    scroll_filter=equal_filter,
+                    limit=min(200, limit + 1 - len(page)),
+                    offset=offset,
+                    with_payload=True,
+                    with_vectors=False,
+                )
+                for point in points:
+                    include(point, final_time)
+                if next_offset is None:
+                    break
+                offset = next_offset
+
+        has_more = len(page) > limit
+        page = page[:limit]
+        return {
+            "results": [item for _, item in page],
+            "next_offset": json.dumps(page[-1][0]) if has_more else None,
         }
 
     def update_content(

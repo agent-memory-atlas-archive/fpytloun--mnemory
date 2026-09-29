@@ -603,7 +603,31 @@
               <option value="consolidated">Consolidated</option>
             </select>
           </div>
-          <div class="text-xs text-muted pb-2">Stable server order</div>
+          <div>
+            <label for="mem-sort" class="block text-xs text-secondary mb-1">Created order</label>
+            <select id="mem-sort" x-model="sortBy" @change="onSortChange()" class="select text-sm">
+              <option value="newest">Newest first</option>
+              <option value="oldest">Oldest first</option>
+              <option value="storage">Storage order</option>
+            </select>
+          </div>
+          <div>
+            <label for="mem-date" class="block text-xs text-secondary mb-1">Created</label>
+            <select id="mem-date" x-model="dateFilter" @change="applyFilters()" class="select text-sm">
+              <option value="all">Any time</option>
+              <option value="today">Today</option>
+              <option value="hour">Last hour</option>
+              <option value="custom">Custom range</option>
+            </select>
+          </div>
+          <div x-show="dateFilter === 'custom'">
+            <label for="mem-start" class="block text-xs text-secondary mb-1">From (inclusive)</label>
+            <input id="mem-start" type="datetime-local" x-model="customStart" @change="applyFilters()" class="input text-sm">
+          </div>
+          <div x-show="dateFilter === 'custom'">
+            <label for="mem-end" class="block text-xs text-secondary mb-1">Until (exclusive)</label>
+            <input id="mem-end" type="datetime-local" x-model="customEnd" @change="applyFilters()" class="input text-sm">
+          </div>
           <div class="flex items-center gap-2">
             <input type="checkbox" x-model="filterDecayedOnly" @change="applyFilters()" id="mem-decayed"
                    class="rounded border-brand-border bg-brand-elevated text-brand-accent focus:ring-brand-accent/30">
@@ -714,8 +738,9 @@
                       pinned
                      </span>
                    </div>
-                   <div class="mt-2 flex flex-wrap gap-x-4 gap-y-1 text-xs text-muted">
-                     <span x-text="'Accessed ' + (formatDate(mem.metadata?.last_accessed_at) || 'never')"></span>
+                    <div class="mt-2 flex flex-wrap gap-x-4 gap-y-1 text-xs text-muted">
+                      <span x-text="'Created ' + (formatDate(mem.metadata?.created_at_utc) || 'unknown')"></span>
+                      <span x-text="'Accessed ' + (formatDate(mem.metadata?.last_accessed_at) || 'never')"></span>
                      <span x-text="'Validated ' + (formatDate(mem.metadata?.last_validated_at || mem.metadata?.checked_at) || 'never')"></span>
                      <span x-text="'Expires ' + (formatDate(mem.metadata?.expires_at) || 'never')"></span>
                    </div>
